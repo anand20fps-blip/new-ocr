@@ -1,0 +1,1 @@
+[2026-10-15 09:45:00] [b2ec974] feat: Extract PDF text with Windows Scan text for content checks. Pages are rendered to PNG, read with Windows OCR, then repaired for the copyright sign, Latin accents, Turkish, Japanese, Chinese, Korean, and Tamil. Two- and three-column pages are read down the left column first.
