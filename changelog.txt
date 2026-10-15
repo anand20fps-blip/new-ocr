@@ -1,1 +1,2 @@
 [2026-10-15 09:45:00] [b2ec974] feat: Extract PDF text with Windows Scan text for content checks. Pages are rendered to PNG, read with Windows OCR, then repaired for the copyright sign, Latin accents, Turkish, Japanese, Chinese, Korean, and Tamil. Two- and three-column pages are read down the left column first.
+[2026-10-15 17:07:22] [dbf7358] fix: Read each page from top to bottom instead of splitting columns. A two-column page keeps the left and right entries on the same horizontal line.
