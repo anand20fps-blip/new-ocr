@@ -107,7 +107,10 @@ def apply_character_repairs(image_path: Path, lines: list[Line], tessdata: Path 
 
 
 def _page_text(lines: list[Line]) -> str:
-    ordered = _reading_order(lines)
+    ordered = sorted(
+        (line for line in lines if line.words),
+        key=lambda line: min(word.y for word in line.words),
+    )
     parts: list[str] = []
     for line in ordered:
         text = _join_line(line.words)
@@ -115,129 +118,6 @@ def _page_text(lines: list[Line]) -> str:
         if text:
             parts.append(text)
     return "\n".join(parts).strip()
-
-
-def _reading_order(lines: list[Line]) -> list[Line]:
-    """Read a two- or three-column page down the left column, then the next.
-
-    A line that stretches across the text width stays where it is, so a
-    running header or footer is not pulled into a column. A one-column page
-    is unchanged.
-    """
-    usable = [line for line in lines if line.words]
-    if len(usable) < 6:
-        return _by_y(usable)
-    usable = _merge_line_fragments(usable)
-    span = _text_span(usable)
-    if span < 1:
-        return _by_y(usable)
-    full = [line for line in usable if _line_width(line) >= 0.72 * span]
-    body = [line for line in usable if line not in full]
-    columns = _split_columns(body, span)
-    if len(columns) < 2:
-        return _by_y(usable)
-    column_top = min(_line_y(line) for column in columns for line in column)
-    above = [line for line in full if _line_y(line) < column_top - 8]
-    below = [line for line in full if line not in above]
-    ordered = _by_y(above)
-    for column in columns:
-        ordered.extend(_by_y(column))
-    ordered.extend(_by_y(below))
-    return ordered
-
-
-def _split_columns(lines: list[Line], span: float) -> list[list[Line]]:
-    if len(lines) < 6:
-        return [lines]
-    ordered = sorted(lines, key=_line_x0)
-    gap_min = span * 0.18
-    clusters: list[list[Line]] = [[ordered[0]]]
-    for previous, line in zip(ordered, ordered[1:]):
-        if _line_x0(line) - _line_x0(previous) >= gap_min:
-            clusters.append([line])
-        else:
-            clusters[-1].append(line)
-    columns = [cluster for cluster in clusters if len(cluster) >= 3]
-    if len(columns) < 2:
-        return [lines]
-    centers = [sum(_line_x0(line) for line in column) / len(column) for column in columns]
-    for cluster in clusters:
-        if len(cluster) >= 3:
-            continue
-        for line in cluster:
-            nearest = min(range(len(columns)), key=lambda index: abs(_line_x0(line) - centers[index]))
-            columns[nearest].append(line)
-    columns.sort(key=lambda column: min(_line_x0(line) for line in column))
-    return columns
-
-
-def _merge_line_fragments(lines: list[Line]) -> list[Line]:
-    """Join a wrapped tail that Scan text split off the end of the same line."""
-    span = _text_span(lines)
-    parent = list(range(len(lines)))
-
-    def find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    # A wrapped tail sits a short gap past its own line. The next column
-    # starts much farther from that line's left edge, so it is not a tail.
-    gap_limit = 32.0
-    same_column = span * 0.48
-    for i, left in enumerate(lines):
-        for j in range(i + 1, len(lines)):
-            right = lines[j]
-            pair = (left, right) if _line_x0(left) <= _line_x0(right) else (right, left)
-            if not _same_band(pair[0], pair[1]):
-                continue
-            gap = _line_x0(pair[1]) - _line_x1(pair[0])
-            if gap < 0 or gap > gap_limit:
-                continue
-            if _line_x0(pair[1]) - _line_x0(pair[0]) > same_column:
-                continue
-            parent[find(j)] = find(i)
-    groups: dict[int, list[Word]] = {}
-    for index, line in enumerate(lines):
-        groups.setdefault(find(index), []).extend(line.words)
-    merged = [Line(sorted(words, key=lambda word: word.x)) for words in groups.values()]
-    return merged
-
-
-def _by_y(lines: list[Line]) -> list[Line]:
-    return sorted(lines, key=_line_y)
-
-
-def _text_span(lines: list[Line]) -> float:
-    if not lines:
-        return 0.0
-    return max(_line_x1(line) for line in lines) - min(_line_x0(line) for line in lines)
-
-
-def _line_x0(line: Line) -> float:
-    return min(word.x for word in line.words)
-
-
-def _line_x1(line: Line) -> float:
-    return max(word.x + word.w for word in line.words)
-
-
-def _line_y(line: Line) -> float:
-    return min(word.y for word in line.words)
-
-
-def _line_width(line: Line) -> float:
-    return _line_x1(line) - _line_x0(line)
-
-
-def _line_height(line: Line) -> float:
-    return max(word.h for word in line.words)
-
-
-def _same_band(left: Line, right: Line) -> bool:
-    band = 0.55 * max(_line_height(left), _line_height(right), 8)
-    return abs(_line_y(left) - _line_y(right)) <= band
 
 
 def _join_line(words: list[Word]) -> str:
