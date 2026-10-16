@@ -1,2 +1,3 @@
 pymupdf>=1.24.0
 winsdk>=1.0.0b10
+python-docx>=1.1.0

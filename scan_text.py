@@ -1,8 +1,9 @@
 """Windows Scan text, plus the characters that English Scan text drops.
 
-Scan text stays the reading of the page. A second pass only fills in characters
-English cannot keep: the copyright sign, Latin accents, Turkish letters, and
-Japanese, Chinese, Korean, and Tamil.
+Scan text stays the reading of the page. A second pass fills in what English
+drops: the copyright sign, any accented Latin letter Unicode defines, Turkish
+letters, and Japanese, Chinese, Korean, Tamil, Thai, Arabic, Malayalam, and
+Telugu. Quotes, dashes, currency, and other symbols are kept when the scan reads them.
 """
 
 from __future__ import annotations
@@ -28,9 +29,14 @@ _MODELS = {
     "chi_tra.traineddata": "https://github.com/tesseract-ocr/tessdata_fast/raw/main/chi_tra.traineddata",
     "kor.traineddata": "https://github.com/tesseract-ocr/tessdata_fast/raw/main/kor.traineddata",
     "tam.traineddata": "https://github.com/tesseract-ocr/tessdata_fast/raw/main/tam.traineddata",
+    "tha.traineddata": "https://github.com/tesseract-ocr/tessdata_fast/raw/main/tha.traineddata",
+    "ara.traineddata": "https://github.com/tesseract-ocr/tessdata_fast/raw/main/ara.traineddata",
+    "mal.traineddata": "https://github.com/tesseract-ocr/tessdata_fast/raw/main/mal.traineddata",
+    "tel.traineddata": "https://github.com/tesseract-ocr/tessdata_fast/raw/main/tel.traineddata",
 }
 _LATIN_LANGS = "Latin+tur"
-_SCRIPT_LANGS = "jpn+chi_sim+chi_tra+kor+tam"
+_SCRIPT_LANGS = "jpn+chi_sim+chi_tra+kor+tam+tha+ara+mal+tel"
+_SCRIPTS = {"han", "kana", "hangul", "tamil", "thai", "arabic", "malayalam", "telugu"}
 _TURKISH = set("\u011f\u011e\u015f\u015e\u0131\u0130")
 _COPY_TOKENS = {"0", "O", "o", "Q"}
 
@@ -48,6 +54,15 @@ class Word:
 @dataclass
 class Line:
     words: list[Word]
+
+
+@dataclass
+class PlacedLine:
+    text: str
+    x: int
+    y: int
+    w: int
+    h: int
 
 
 def ensure_models() -> Path | None:
@@ -73,8 +88,8 @@ def ensure_models() -> Path | None:
         print("Script supplement off, missing: " + ", ".join(missing), flush=True)
         return None
     print(
-        "Script supplement: Latin accents, Turkish, Japanese, "
-        "Chinese, Korean, Tamil",
+        "Script supplement: Latin accents, Turkish, Japanese, Chinese, "
+        "Korean, Tamil, Thai, Arabic, Malayalam, Telugu",
         flush=True,
     )
     return _TESSDATA
@@ -103,20 +118,34 @@ def apply_character_repairs(image_path: Path, lines: list[Line], tessdata: Path 
     if tessdata is not None:
         _merge_special_words(lines, _read_tsv(image_path, tessdata, _LATIN_LANGS), latin=True)
         _merge_special_words(lines, _read_tsv(image_path, tessdata, _SCRIPT_LANGS), latin=False)
+        _repair_printed_accents(image_path, lines, tessdata)
     return _page_text(lines)
 
 
-def _page_text(lines: list[Line]) -> str:
-    ordered = sorted(
+def _ordered_lines(lines: list[Line]) -> list[Line]:
+    return sorted(
         (line for line in lines if line.words),
-        key=lambda line: min(word.y for word in line.words),
+        key=lambda line: (min(word.y for word in line.words), min(word.x for word in line.words)),
     )
-    parts: list[str] = []
-    for line in ordered:
-        text = _join_line(line.words)
-        text = text.strip()
-        if text:
-            parts.append(text)
+
+
+def placed_lines(lines: list[Line]) -> list[PlacedLine]:
+    """One entry per visual line, with its box in image pixels."""
+    placed: list[PlacedLine] = []
+    for line in _ordered_lines(lines):
+        text = _join_line(line.words).strip()
+        if not text:
+            continue
+        x0 = min(word.x for word in line.words)
+        y0 = min(word.y for word in line.words)
+        x1 = max(word.x + word.w for word in line.words)
+        y1 = max(word.y + word.h for word in line.words)
+        placed.append(PlacedLine(text, x0, y0, max(1, x1 - x0), max(1, y1 - y0)))
+    return placed
+
+
+def _page_text(lines: list[Line]) -> str:
+    parts = [line.text for line in placed_lines(lines)]
     return "\n".join(parts).strip()
 
 
@@ -273,6 +302,384 @@ def _read_tsv(image_path: Path, tessdata: Path, langs: str) -> list[Word]:
     return words
 
 
+def _ink_rows(image_path: Path) -> tuple[list[bytearray], int]:
+    import pymupdf
+
+    pixmap = pymupdf.Pixmap(str(image_path))
+    raw = pixmap.samples
+    channels = pixmap.n
+    width = pixmap.width
+    rows: list[bytearray] = []
+    for y in range(pixmap.height):
+        base = y * pixmap.stride
+        row = bytearray(width)
+        if channels == 1:
+            line = raw[base : base + width]
+            for x, gray in enumerate(line):
+                if gray < 150:
+                    row[x] = 1
+        else:
+            line = raw[base : base + width * channels]
+            for x in range(width):
+                pixel = x * channels
+                gray = (line[pixel] + line[pixel + 1] + line[pixel + 2]) // 3
+                if gray < 150:
+                    row[x] = 1
+        rows.append(row)
+    return rows, pixmap.height
+
+
+def _char_boxes(image_path: Path, tessdata: Path, height: int) -> list[tuple[str, int, int, int, int]]:
+    """Character boxes from Tesseract, in top-left image pixels."""
+    exe = _tesseract()
+    if exe is None:
+        return []
+    try:
+        proc = subprocess.run(
+            [
+                str(exe),
+                str(image_path),
+                "stdout",
+                "--tessdata-dir",
+                str(tessdata),
+                "-l",
+                _LATIN_LANGS,
+                "--oem",
+                "1",
+                "--psm",
+                "3",
+                "makebox",
+            ],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return []
+    if proc.returncode != 0:
+        return []
+    boxes: list[tuple[str, int, int, int, int]] = []
+    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) < 5 or len(parts[0]) != 1:
+            continue
+        left, bottom, right, top = (int(float(parts[i])) for i in range(1, 5))
+        boxes.append((parts[0], left, height - top, right, height - bottom))
+    return boxes
+
+
+def _accent_blobs(mask: list[list[int]]) -> list[list[tuple[int, int]]]:
+    if not mask or not mask[0]:
+        return []
+    height, width = len(mask), len(mask[0])
+    seen = [[False] * width for _ in range(height)]
+    blobs: list[list[tuple[int, int]]] = []
+    for y in range(height):
+        for x in range(width):
+            if not mask[y][x] or seen[y][x]:
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            points: list[tuple[int, int]] = []
+            while stack:
+                cx, cy = stack.pop()
+                points.append((cx, cy))
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if 0 <= nx < width and 0 <= ny < height and mask[ny][nx] and not seen[ny][nx]:
+                        seen[ny][nx] = True
+                        stack.append((nx, ny))
+            if len(points) >= 4:
+                blobs.append(points)
+    return blobs
+
+
+def _has_hole(points: list[tuple[int, int]]) -> bool:
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if width < 5 or height < 5:
+        return False
+    ink = [[False] * width for _ in range(height)]
+    for x, y in points:
+        ink[y - y0][x - x0] = True
+    seen = [[False] * width for _ in range(height)]
+    stack = []
+    for x in range(width):
+        stack.append((x, 0))
+        stack.append((x, height - 1))
+    for y in range(height):
+        stack.append((0, y))
+        stack.append((width - 1, y))
+    while stack:
+        x, y = stack.pop()
+        if not 0 <= x < width or not 0 <= y < height or seen[y][x] or ink[y][x]:
+            continue
+        seen[y][x] = True
+        stack.extend(((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)))
+    return any(not ink[y][x] and not seen[y][x] for y in range(height) for x in range(width))
+
+
+def _blob_size(points: list[tuple[int, int]]) -> tuple[int, int]:
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+
+
+def _is_dot(points: list[tuple[int, int]]) -> bool:
+    """A round mark. A short diagonal stroke is square too, but it has a slope."""
+    width, height = _blob_size(points)
+    fill = len(points) / max(1, width * height)
+    compact = max(width, height) <= 1.6 * min(width, height) and width <= 8 and fill >= 0.4
+    return compact and abs(_slope(points)) < 0.35
+
+
+def _slope(points: list[tuple[int, int]]) -> float:
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    variance = sum((x - mean_x) ** 2 for x in xs)
+    if variance < 1:
+        return 0.0
+    return sum((x - mean_x) * (y - mean_y) for x, y in points) / variance
+
+
+def _tops(points: list[tuple[int, int]]) -> list[int] | None:
+    """Highest ink in each column. Image y grows downward, so a smaller value is higher."""
+    by_x: dict[int, int] = {}
+    for x, y in points:
+        by_x[x] = y if x not in by_x else min(by_x[x], y)
+    xs = sorted(by_x)
+    if len(xs) < 4:
+        return None
+    return [by_x[x] for x in xs]
+
+
+def _outline_mark(points: list[tuple[int, int]]) -> str | None:
+    """Circumflex, caron, breve, or tilde, from the top edge of one accent."""
+    tops = _tops(points)
+    if not tops:
+        return None
+    width, height = _blob_size(points)
+    if width < height:
+        return None
+    third = max(1, len(tops) // 3)
+    left = sum(tops[:third]) / third
+    mid_slice = tops[third : len(tops) - third] or tops
+    mid = sum(mid_slice) / len(mid_slice)
+    right = sum(tops[-third:]) / third
+    # Two direction changes along the top edge: a tilde.
+    signs: list[int] = []
+    for previous, current in zip(tops, tops[1:]):
+        sign = 1 if current > previous + 0 else (-1 if current < previous else 0)
+        if sign and (not signs or signs[-1] != sign):
+            signs.append(sign)
+    if len(signs) >= 3 and width >= 2 * height:
+        return "\u0303"
+    peak = min(left, right) - mid
+    valley = mid - max(left, right)
+    if peak >= 0.4 * max(height, 1) and mid < left and mid < right:
+        return "\u0302"
+    if valley >= 0.4 * max(height, 1) and mid > left and mid > right:
+        # A caron comes to a point. A breve is the same arch, but shallow.
+        return "\u030c" if valley >= 0.45 * max(height, 1) else "\u0306"
+    return None
+
+
+def _mark_from_blobs(blobs: list[list[tuple[int, int]]]) -> str | None:
+    if len(blobs) >= 2:
+        pair = sorted(blobs, key=len, reverse=True)[:2]
+        first, second = pair
+        y1 = sum(point[1] for point in first) / len(first)
+        y2 = sum(point[1] for point in second) / len(second)
+        x1 = sum(point[0] for point in first) / len(first)
+        x2 = sum(point[0] for point in second) / len(second)
+        side_by_side = abs(y1 - y2) <= 4 and abs(x1 - x2) >= 3
+        if side_by_side and _is_dot(first) and _is_dot(second):
+            return "\u0308"
+        if side_by_side and _slope(first) <= -0.2 and _slope(second) <= -0.2:
+            return "\u030b"
+    points = max(blobs, key=len)
+    width, height = _blob_size(points)
+    if _has_hole(points) and 0.6 <= width / max(height, 1) <= 1.7:
+        return "\u030a"
+    if width >= 1.6 * height and height <= 6:
+        return "\u0304"
+    outlined = _outline_mark(points)
+    if outlined:
+        return outlined
+    slope = _slope(points)
+    if _is_dot(points):
+        return None
+    if slope <= -0.2:
+        return "\u0301"
+    if slope >= 0.2:
+        return "\u0300"
+    return None
+
+
+def _printed_mark(rows: list[bytearray], box: tuple[int, int, int, int]) -> str | None:
+    """The accent floating above this glyph, read from its shape."""
+    mark = _printed_mark_in(rows, box)
+    if mark:
+        return mark
+    # A short acute is often clipped on the right edge of the character box.
+    x0, y0, x1, y1 = box
+    return _printed_mark_in(rows, (x0, y0, x1 + 6, y1))
+
+
+def _printed_mark_in(rows: list[bytearray], box: tuple[int, int, int, int]) -> str | None:
+    height, width = len(rows), len(rows[0])
+    x0 = max(0, box[0])
+    y0 = max(0, box[1])
+    x1 = min(width, box[2])
+    y1 = min(height, box[3])
+    if x1 - x0 < 4 or y1 - y0 < 8:
+        return None
+    counts = [sum(rows[y][x0:x1]) for y in range(y0, y1)]
+    gap = None
+    seen = False
+    limit = int(len(counts) * 0.62)
+    valley = None
+    for index, count in enumerate(counts[:limit]):
+        if count >= 2:
+            seen = True
+        if not seen or index < 2:
+            continue
+        below = max(counts[index + 1 : index + 10], default=0)
+        if count <= 1 and below >= 3:
+            gap = index
+            break
+        if (
+            valley is None
+            and count <= 2
+            and counts[index - 1] >= count + 2
+            and below >= count + 4
+        ):
+            valley = index
+    if gap is None:
+        gap = valley
+    if gap is None or gap < 2:
+        return None
+    mask = [list(rows[y0 + y][x0:x1]) for y in range(gap)]
+    blobs = _accent_blobs(mask)
+    if not blobs:
+        return None
+    return _mark_from_blobs(blobs)
+
+
+def _is_below_mark(mark: str) -> bool:
+    if unicodedata.combining(mark) in {202, 220, 222}:
+        return True
+    return "BELOW" in unicodedata.name(mark, "")
+
+
+def _with_printed_mark(char: str, mark: str) -> str:
+    """Attach one combining mark. NFC turns it into the precomposed letter when one exists."""
+    decomposed = unicodedata.normalize("NFD", char)
+    base = decomposed[0]
+    below = _is_below_mark(mark)
+    kept = [item for item in decomposed[1:] if _is_below_mark(item) != below]
+    return unicodedata.normalize("NFC", base + "".join(kept) + mark)
+
+
+def _printed_below(rows: list[bytearray], box: tuple[int, int, int, int]) -> str | None:
+    """Cedilla, ogonek, or dot below, when that ink is detached under the letter."""
+    height, width = len(rows), len(rows[0])
+    x0 = max(0, box[0])
+    y0 = max(0, box[1])
+    x1 = min(width, box[2])
+    y1 = min(height, box[3])
+    if y1 - y0 < 10 or x1 - x0 < 4:
+        return None
+    counts = [sum(rows[y][x0:x1]) for y in range(y0, y1)]
+    start = int(len(counts) * 0.55)
+    gap = None
+    for index in range(start, len(counts) - 2):
+        if counts[index] <= 1 and counts[index - 1] >= 3 and max(counts[index + 1 :], default=0) >= 3:
+            gap = index
+            break
+    if gap is None:
+        return None
+    mask = [list(rows[y0 + y][x0:x1]) for y in range(gap + 1, len(counts))]
+    blobs = _accent_blobs(mask)
+    if not blobs:
+        return None
+    points = max(blobs, key=len)
+    blob_w, blob_h = _blob_size(points)
+    if _is_dot(points):
+        return "\u0323"
+    # A cedilla hangs down. An ogonek trails toward the right.
+    xs = [point[0] for point in points]
+    center = (min(xs) + max(xs)) / 2
+    body_center = (x1 - x0) / 2
+    if center > body_center + 1 and blob_w >= blob_h:
+        return "\u0328"
+    if blob_h >= 3:
+        return "\u0327"
+    return None
+
+
+def _same_letter(host: str, read: str) -> bool:
+    host_base, read_base = _skeleton(host), _skeleton(read)
+    return host_base == read_base or {host_base, read_base} == {"f", "i"}
+
+
+def _repair_printed_accents(image_path: Path, lines: list[Line], tessdata: Path) -> None:
+    """Replace an accent with the mark actually printed above that letter."""
+    rows, height = _ink_rows(image_path)
+    boxes = _char_boxes(image_path, tessdata, height)
+    if not boxes:
+        return
+    corrected: list[tuple[str, int, int, int, int, bool]] = []
+    for char, x0, y0, x1, y1 in boxes:
+        # Only re-read a mark the engine already saw. Do not invent one on a plain letter.
+        pieces = unicodedata.normalize("NFD", char)[1:] if char.isalpha() else ""
+        above = any(not _is_below_mark(item) for item in pieces)
+        below = any(_is_below_mark(item) for item in pieces)
+        mark = _printed_mark(rows, (x0, y0, x1, y1)) if above else None
+        if mark is None and below:
+            mark = _printed_below(rows, (x0, y0, x1, y1))
+        corrected.append(
+            (_with_printed_mark(char, mark) if mark else char, x0, y0, x1, y1, mark is not None)
+        )
+    for line in lines:
+        for word in line.words:
+            inside = [
+                item
+                for item in corrected
+                if word.x - 3 <= (item[1] + item[3]) / 2 <= word.x + word.w + 3
+                and word.y - 6 <= (item[2] + item[4]) / 2 <= word.y + word.h + 6
+            ]
+            inside.sort(key=lambda item: item[1])
+            letters = [(item[0], item[5]) for item in inside if any(ch.isalpha() for ch in item[0])]
+            host = [char for char in word.text if char.isalpha()]
+            if not letters or len(letters) != len(host):
+                continue
+            if not all(
+                _same_letter(host_char, read_char) for host_char, (read_char, _changed) in zip(host, letters)
+            ):
+                continue
+            rebuilt: list[str] = []
+            index = 0
+            for char in word.text:
+                if not char.isalpha():
+                    rebuilt.append(char)
+                    continue
+                replacement, changed = letters[index]
+                # An italic i is often read as f. Trust the character box when it says i.
+                if (
+                    not changed
+                    and _skeleton(char) == "f"
+                    and _skeleton(replacement) == "i"
+                ):
+                    rebuilt.append(replacement)
+                else:
+                    rebuilt.append(replacement if changed else char)
+                index += 1
+            word.text = "".join(rebuilt)
+
+
 def _merge_special_words(lines: list[Line], extra: list[Word], *, latin: bool) -> None:
     if not extra:
         return
@@ -294,14 +701,45 @@ def _merge_latin_words(lines: list[Line], extra: list[Word]) -> None:
         same_ink = _overlap_ratio(candidate, host) >= 0.85
         if host.text == candidate.text:
             continue
+        if _accent_conflict(host.text, candidate.text):
+            continue
         if same_word and _mark_count(candidate.text) >= _mark_count(host.text):
             host.text = candidate.text
         elif same_ink and _mark_count(candidate.text) > _mark_count(host.text):
             host.text = candidate.text
 
 
+def _letter_marks(text: str) -> list[tuple[str, str]]:
+    letters: list[tuple[str, str]] = []
+    for char in unicodedata.normalize("NFD", text):
+        if unicodedata.combining(char):
+            if letters:
+                base, marks = letters[-1]
+                letters[-1] = (base, marks + char)
+            continue
+        if char.isalpha():
+            letters.append((char.casefold(), ""))
+    return letters
+
+
+def _accent_conflict(host: str, candidate: str) -> bool:
+    """Do not swap a mark that Scan text already read for a different mark."""
+    host_letters = _letter_marks(host)
+    candidate_letters = _letter_marks(candidate)
+    if len(host_letters) != len(candidate_letters):
+        return False
+    for (host_base, host_marks), (candidate_base, candidate_marks) in zip(
+        host_letters, candidate_letters
+    ):
+        if host_base != candidate_base:
+            return False
+        if host_marks and host_marks != candidate_marks:
+            return True
+    return False
+
+
 def _merge_script_lines(lines: list[Line], extra: list[Word]) -> None:
-    """Add Japanese, Chinese, Korean, and Tamil lines Scan text skipped.
+    """Add Japanese, Chinese, Korean, Tamil, Thai, Arabic, Malayalam, and Telugu lines Scan text skipped.
 
     One false letter on an English page is ignored. A real script line has
     several characters, and that whole line is kept in reading order.
@@ -310,6 +748,8 @@ def _merge_script_lines(lines: list[Line], extra: list[Word]) -> None:
     if sum(_script_letters(word.text) for word in strong) < 3:
         return
     for cluster in _cluster_words(strong):
+        if sum(_script_letters(word.text) for word in cluster) < 3:
+            continue
         host = _line_near(lines, cluster)
         ordered = sorted(cluster, key=lambda word: word.x)
         if host is None:
@@ -320,8 +760,7 @@ def _merge_script_lines(lines: list[Line], extra: list[Word]) -> None:
         latin_letters = sum(
             1 for word in host.words for ch in word.text if ch.isascii() and ch.isalpha()
         )
-        script_letters = sum(_script_letters(word.text) for word in cluster)
-        if latin_letters >= 8 and script_letters < latin_letters:
+        if latin_letters >= 4:
             continue
         host.words = ordered
 
@@ -401,8 +840,9 @@ def _script_letters(text: str) -> int:
 
 
 def _has_latin_extension(text: str) -> bool:
+    """Any Latin letter outside ASCII, including every accented form Unicode defines."""
     for ch in text:
-        if ch in _TURKISH:
+        if unicodedata.category(ch) == "Mn":
             return True
         if not ch.isalpha() or ord(ch) < 128:
             continue
@@ -415,7 +855,7 @@ def _non_latin_script(text: str) -> bool:
     letters = [ch for ch in text if ch.isalpha()]
     if not letters:
         return False
-    special = sum(1 for ch in letters if _script(ch) in {"han", "kana", "hangul", "tamil"})
+    special = sum(1 for ch in letters if _script(ch) in _SCRIPTS)
     return special / len(letters) >= 0.6
 
 
@@ -429,11 +869,24 @@ def _script(ch: str) -> str:
         return "hangul"
     if 0x0B80 <= code <= 0x0BFF:
         return "tamil"
+    if 0x0E00 <= code <= 0x0E7F:
+        return "thai"
+    if (
+        0x0600 <= code <= 0x06FF
+        or 0x0750 <= code <= 0x077F
+        or 0x08A0 <= code <= 0x08FF
+        or 0xFB50 <= code <= 0xFDFF
+        or 0xFE70 <= code <= 0xFEFF
+    ):
+        return "arabic"
+    if 0x0D00 <= code <= 0x0D7F:
+        return "malayalam"
+    if 0x0C00 <= code <= 0x0C7F:
+        return "telugu"
     return "other"
 
 
-async def recognize(image_path: Path, engine, tessdata: Path | None) -> str:
-    """Read one page image with Scan text, then repair special characters."""
+async def _ocr_lines(image_path: Path, engine) -> tuple[list[Line], str]:
     from winsdk.windows.graphics.imaging import BitmapDecoder
     from winsdk.windows.storage import FileAccessMode, StorageFile
 
@@ -446,9 +899,23 @@ async def recognize(image_path: Path, engine, tessdata: Path | None) -> str:
     finally:
         stream.close()
     lines = _lines_from_result(result)
+    fallback = (result.text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return lines, fallback
+
+
+async def recognize_page(image_path: Path, engine, tessdata: Path | None) -> tuple[str, list[PlacedLine]]:
+    """Read one page. Returns the text and each line's box in image pixels."""
+    lines, fallback = await _ocr_lines(image_path, engine)
     if not lines:
-        return (result.text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    return apply_character_repairs(image_path, lines, tessdata)
+        return fallback, []
+    text = apply_character_repairs(image_path, lines, tessdata)
+    return text, placed_lines(lines)
+
+
+async def recognize(image_path: Path, engine, tessdata: Path | None) -> str:
+    """Read one page image with Scan text, then repair special characters."""
+    text, _placed = await recognize_page(image_path, engine, tessdata)
+    return text
 
 
 def _lines_from_result(result) -> list[Line]:
