@@ -486,6 +486,40 @@ def _outline_mark(points: list[tuple[int, int]]) -> str | None:
     return None
 
 
+def _flat_bar(points: list[tuple[int, int]]) -> bool:
+    tops = _tops(points)
+    if not tops:
+        return False
+    return max(tops) - min(tops) <= 1
+
+
+def _two_column_dots(mask: list[list[int]]) -> str | None:
+    """Two side-by-side dots. A single stroke has no empty column between its ink."""
+    # A circumflex is taller than a pair of dots and must not be split into two.
+    if not mask or not mask[0] or len(mask) > 4:
+        return None
+    width = len(mask[0])
+    cols = [sum(row[x] for row in mask) for x in range(width)]
+    groups: list[tuple[int, int]] = []
+    start = None
+    for index, count in enumerate(cols + [0]):
+        if count:
+            if start is None:
+                start = index
+        elif start is not None:
+            if index - start >= 2 and sum(cols[start:index]) >= 4:
+                groups.append((start, index))
+            start = None
+    if len(groups) < 2:
+        return None
+    left, right = groups[0], groups[1]
+    if right[0] - left[1] < 2:
+        return None
+    if left[1] - left[0] > 8 or right[1] - right[0] > 8:
+        return None
+    return "\u0308"
+
+
 def _mark_from_blobs(blobs: list[list[tuple[int, int]]]) -> str | None:
     if len(blobs) >= 2:
         pair = sorted(blobs, key=len, reverse=True)[:2]
@@ -495,7 +529,13 @@ def _mark_from_blobs(blobs: list[list[tuple[int, int]]]) -> str | None:
         x1 = sum(point[0] for point in first) / len(first)
         x2 = sum(point[0] for point in second) / len(second)
         side_by_side = abs(y1 - y2) <= 4 and abs(x1 - x2) >= 3
-        if side_by_side and _is_dot(first) and _is_dot(second):
+        if (
+            side_by_side
+            and _is_dot(first)
+            and _is_dot(second)
+            and _blob_size(first)[1] <= 4
+            and _blob_size(second)[1] <= 4
+        ):
             return "\u0308"
         if side_by_side and _slope(first) <= -0.2 and _slope(second) <= -0.2:
             return "\u030b"
@@ -503,11 +543,12 @@ def _mark_from_blobs(blobs: list[list[tuple[int, int]]]) -> str | None:
     width, height = _blob_size(points)
     if _has_hole(points) and 0.6 <= width / max(height, 1) <= 1.7:
         return "\u030a"
-    if width >= 1.6 * height and height <= 6:
-        return "\u0304"
+    # A peaked accent is a circumflex or caron. A flat bar is a macron.
     outlined = _outline_mark(points)
     if outlined:
         return outlined
+    if width >= 1.6 * height and height <= 4 and _flat_bar(points):
+        return "\u0304"
     slope = _slope(points)
     if _is_dot(points):
         return None
@@ -562,6 +603,9 @@ def _printed_mark_in(rows: list[bytearray], box: tuple[int, int, int, int]) -> s
     if gap is None or gap < 2:
         return None
     mask = [list(rows[y0 + y][x0:x1]) for y in range(gap)]
+    dots = _two_column_dots(mask)
+    if dots:
+        return dots
     blobs = _accent_blobs(mask)
     if not blobs:
         return None
@@ -625,24 +669,217 @@ def _same_letter(host: str, read: str) -> bool:
     return host_base == read_base or {host_base, read_base} == {"f", "i"}
 
 
+def _box_counts(rows: list[bytearray], box: tuple[int, int, int, int]) -> list[int] | None:
+    height, width = len(rows), len(rows[0])
+    x0 = max(0, box[0])
+    y0 = max(0, box[1])
+    x1 = min(width, box[2])
+    y1 = min(height, box[3])
+    if x1 - x0 < 4 or y1 - y0 < 8:
+        return None
+    return [sum(rows[y][x0:x1]) for y in range(y0, y1)]
+
+
+def _is_strict_macron(rows: list[bytearray], box: tuple[int, int, int, int]) -> bool:
+    """A flat bar at the top of the glyph, with empty rows under it."""
+    counts = _box_counts(rows, box)
+    if not counts or max(counts[0], counts[1] if len(counts) > 1 else 0) < 6:
+        return False
+    gap = None
+    for index in range(2, min(len(counts), 8)):
+        if counts[index] == 0 and counts[index - 1] == 0:
+            gap = index - 1
+            break
+    if gap is None or gap > 4:
+        return False
+    height, width = len(rows), len(rows[0])
+    x0 = max(0, box[0])
+    y0 = max(0, box[1])
+    x1 = min(width, box[2])
+    mask = [list(rows[y0 + y][x0:x1]) for y in range(gap)]
+    if _two_column_dots(mask):
+        return False
+    cols = [sum(row[x] for row in mask) for x in range(len(mask[0]))]
+    ink = [index for index, count in enumerate(cols) if count]
+    if len(ink) < 8 or ink[-1] - ink[0] != len(ink) - 1:
+        return False
+    return True
+
+
+def _long_acute(rows: list[bytearray], box: tuple[int, int, int, int]) -> bool:
+    """A steep stroke above a narrow i. A wide box has swallowed the next letter."""
+    height, width = len(rows), len(rows[0])
+    x0 = max(0, box[0])
+    y0 = max(0, box[1])
+    x1 = min(width, box[2])
+    y1 = min(height, box[3])
+    if x1 - x0 > 14 or y1 - y0 < 16:
+        return False
+    counts = _box_counts(rows, box)
+    if not counts or max(counts[0], counts[1] if len(counts) > 1 else 0) < 2:
+        return False
+    gap = None
+    for index in range(2, int(len(counts) * 0.55)):
+        if index + 1 < len(counts) and counts[index] == 0 and counts[index + 1] == 0:
+            gap = index
+            break
+    if gap is None:
+        return False
+    points = [
+        (x, y)
+        for y in range(y0, y0 + gap)
+        for x in range(x0, x1)
+        if rows[y][x]
+    ]
+    if len(points) < 16 or _slope(points) > -0.6:
+        return False
+    blob_w, blob_h = _blob_size(points)
+    if blob_w < 5 or blob_h < 5:
+        return False
+    fill = len(points) / (blob_w * blob_h)
+    return fill <= 0.75
+
+
+def _is_inverted_question(rows: list[bytearray], box: tuple[int, int, int, int]) -> bool:
+    """A dot over a hook. An i has a stem about as wide as its dot."""
+    counts = _box_counts(rows, box)
+    if not counts:
+        return False
+    gap = None
+    for index in range(2, min(len(counts) // 2, 16)):
+        if counts[index] <= 1 and counts[index + 1] <= 1 and max(counts[:index]) >= 2:
+            gap = index
+            break
+    if gap is None:
+        return False
+    height, width = len(rows), len(rows[0])
+    x0 = max(0, box[0])
+    y0 = max(0, box[1])
+    x1 = min(width, box[2])
+    y1 = min(height, box[3])
+    def span(y_start: int, y_end: int) -> int:
+        ink = [x for y in range(y_start, y_end) for x in range(x0, x1) if rows[y][x]]
+        return (max(ink) - min(ink) + 1) if ink else 0
+    dot_w = span(y0, y0 + gap)
+    hook_w = span(y0 + gap + 1, y1)
+    mid = y0 + gap + max(1, (y1 - (y0 + gap)) // 2)
+    middle_w = span(y0 + gap + 1, mid)
+    bottom_w = span(mid, y1)
+    # A hook flares toward the bottom. An i stem stays the same width.
+    return (
+        2 <= dot_w <= 6
+        and hook_w >= 10
+        and hook_w >= dot_w * 2.2
+        and bottom_w >= middle_w + 3
+    )
+
+
+def _splice_apostrophe(host: str, boxed: str) -> str | None:
+    """Put back an apostrophe Scan text folded into the next letter."""
+    box = [char for char in boxed if char.isalpha() or char in "'’‘`"]
+    if not any(char in "'’‘`" for char in box):
+        return None
+    host_chars = list(host)
+    index = 0
+    rebuilt: list[str] = []
+    used = False
+    for char in box:
+        if char in "'’‘`":
+            if index < len(host_chars) and host_chars[index] in "'’‘`":
+                rebuilt.append(host_chars[index])
+                index += 1
+            elif index < len(host_chars) and host_chars[index] in "tl1I|":
+                rebuilt.append("'")
+                index += 1
+            else:
+                rebuilt.append("'")
+            used = True
+            continue
+        while index < len(host_chars) and not host_chars[index].isalpha():
+            rebuilt.append(host_chars[index])
+            index += 1
+        if index >= len(host_chars) or not _same_letter(host_chars[index], char):
+            return None
+        rebuilt.append(host_chars[index])
+        index += 1
+    while index < len(host_chars):
+        rebuilt.append(host_chars[index])
+        index += 1
+    if not used:
+        return None
+    result = "".join(rebuilt)
+    return result if result != host else None
+
+
+def _fit_letters(
+    host: list[str], letters: list[tuple[str, bool]]
+) -> list[tuple[str, bool]] | None:
+    """Match character boxes to a word, dropping one repeated letter beside its accented form."""
+    def matches(trial: list[tuple[str, bool]]) -> bool:
+        return len(trial) == len(host) and all(
+            _same_letter(host_char, read_char) for host_char, (read_char, _changed) in zip(host, trial)
+        )
+
+    if matches(letters):
+        return letters
+    if len(letters) != len(host) + 1:
+        return None
+    for index in range(len(letters) - 1):
+        left, right = letters[index][0], letters[index + 1][0]
+        if not _same_letter(left, right):
+            continue
+        drop_left = _mark_count(right) >= _mark_count(left)
+        trial = letters[:index] + letters[index + 1 :] if drop_left else letters[: index + 1] + letters[index + 2 :]
+        if matches(trial):
+            return trial
+    return None
+
+
 def _repair_printed_accents(image_path: Path, lines: list[Line], tessdata: Path) -> None:
-    """Replace an accent with the mark actually printed above that letter."""
+    """Read accents, apostrophes, and ¿ from the glyph ink and the character boxes."""
     rows, height = _ink_rows(image_path)
     boxes = _char_boxes(image_path, tessdata, height)
     if not boxes:
         return
     corrected: list[tuple[str, int, int, int, int, bool]] = []
     for char, x0, y0, x1, y1 in boxes:
-        # Only re-read a mark the engine already saw. Do not invent one on a plain letter.
+        box = (x0, y0, x1, y1)
         pieces = unicodedata.normalize("NFD", char)[1:] if char.isalpha() else ""
-        above = any(not _is_below_mark(item) for item in pieces)
-        below = any(_is_below_mark(item) for item in pieces)
-        mark = _printed_mark(rows, (x0, y0, x1, y1)) if above else None
-        if mark is None and below:
-            mark = _printed_below(rows, (x0, y0, x1, y1))
-        corrected.append(
-            (_with_printed_mark(char, mark) if mark else char, x0, y0, x1, y1, mark is not None)
-        )
+        has_above = any(not _is_below_mark(item) for item in pieces)
+        has_below = any(_is_below_mark(item) for item in pieces)
+        detected = _printed_mark(rows, box) if char.isalpha() else None
+        replacement = char
+        changed = False
+        if char.isalpha() and _is_strict_macron(rows, box):
+            replacement = _with_printed_mark(char, "\u0304")
+            changed = True
+        elif (
+            has_above
+            and detected is None
+            and "\u0302" in pieces
+        ):
+            # A circumflex the shape reader did not contradict.
+            replacement = char
+            changed = True
+        elif has_above and detected:
+            replacement = _with_printed_mark(char, detected)
+            changed = True
+        elif has_below:
+            below = _printed_below(rows, box)
+            if below:
+                replacement = _with_printed_mark(char, below)
+                changed = True
+        if (
+            not changed
+            and _skeleton(char) in {"s", "n", "r"}
+            and _printed_below(rows, box) == "\u0323"
+        ):
+            replacement = _with_printed_mark(char, "\u0323")
+            changed = True
+        if not changed and _skeleton(char) == "i" and _long_acute(rows, box):
+            replacement = _with_printed_mark(char, "\u0301")
+            changed = True
+        corrected.append((replacement, x0, y0, x1, y1, changed))
     for line in lines:
         for word in line.words:
             inside = [
@@ -652,14 +889,18 @@ def _repair_printed_accents(image_path: Path, lines: list[Line], tessdata: Path)
                 and word.y - 6 <= (item[2] + item[4]) / 2 <= word.y + word.h + 6
             ]
             inside.sort(key=lambda item: item[1])
+            if inside and _is_inverted_question(rows, (inside[0][1], inside[0][2], inside[0][3], inside[0][4])):
+                if word.text[:1] in "iIlZz":
+                    word.text = "\u00bf" + word.text[1:]
+            spliced = _splice_apostrophe(word.text, "".join(item[0] for item in inside))
+            if spliced:
+                word.text = spliced
             letters = [(item[0], item[5]) for item in inside if any(ch.isalpha() for ch in item[0])]
             host = [char for char in word.text if char.isalpha()]
-            if not letters or len(letters) != len(host):
+            fitted = _fit_letters(host, letters)
+            if fitted is None:
                 continue
-            if not all(
-                _same_letter(host_char, read_char) for host_char, (read_char, _changed) in zip(host, letters)
-            ):
-                continue
+            letters = fitted
             rebuilt: list[str] = []
             index = 0
             for char in word.text:
@@ -667,17 +908,60 @@ def _repair_printed_accents(image_path: Path, lines: list[Line], tessdata: Path)
                     rebuilt.append(char)
                     continue
                 replacement, changed = letters[index]
-                # An italic i is often read as f. Trust the character box when it says i.
+                index += 1
+                host_marks = unicodedata.normalize("NFD", char)
+                read_marks = unicodedata.normalize("NFD", replacement)
+                # The tail of s at the end of a word is not a dot underneath it.
                 if (
-                    not changed
-                    and _skeleton(char) == "f"
-                    and _skeleton(replacement) == "i"
+                    index == len(letters)
+                    and "\u0323" in read_marks
+                    and "\u0323" not in host_marks
+                ):
+                    rebuilt.append(char)
+                    continue
+                if changed:
+                    rebuilt.append(replacement)
+                elif (
+                    char.isascii()
+                    and replacement[:1].islower()
+                    and _has_latin_extension(replacement)
+                    and _same_letter(char, replacement)
                 ):
                     rebuilt.append(replacement)
+                elif _skeleton(char) == "f" and _skeleton(replacement) == "i":
+                    rebuilt.append(replacement)
                 else:
-                    rebuilt.append(replacement if changed else char)
-                index += 1
+                    rebuilt.append(char)
             word.text = "".join(rebuilt)
+    _insert_orphan_quotes(lines, boxes)
+
+
+def _insert_orphan_quotes(lines: list[Line], boxes: list[tuple[str, int, int, int, int]]) -> None:
+    """A quote Scan text dropped, placed on the line it sits beside."""
+    quotes = {"\u201c", "\u201d", "\u2018", "\u2019", "\u00ab", "\u00bb"}
+    placed = [word for line in lines for word in line.words]
+    for char, x0, y0, x1, y1 in boxes:
+        if char not in quotes:
+            continue
+        center_x = (x0 + x1) / 2
+        center_y = (y0 + y1) / 2
+        if any(
+            word.x - 4 <= center_x <= word.x + word.w + 4
+            and word.y - 6 <= center_y <= word.y + word.h + 6
+            for word in placed
+        ):
+            continue
+        nearest = min(
+            lines,
+            key=lambda line: abs(min(word.y for word in line.words) - y0),
+            default=None,
+        )
+        if nearest is None:
+            continue
+        word = Word(char, x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+        nearest.words.append(word)
+        nearest.words.sort(key=lambda item: item.x)
+        placed.append(word)
 
 
 def _merge_special_words(lines: list[Line], extra: list[Word], *, latin: bool) -> None:
